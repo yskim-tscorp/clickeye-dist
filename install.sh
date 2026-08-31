@@ -13,8 +13,10 @@
 #     sudo sh install.sh --project <이름> --cloud-url wss://<host>/ws/daemon --token <토큰> \
 #          [소스옵션] [--daemon-id <ID>] [--no-start]
 #
-# 설치 소스 3종 — 하나만 지정한다 (여러 개면 거부):
-#   --binary <경로>              로컬 바이너리 (기본: 스크립트 옆 ./daemond)
+# 설치 소스 3종 — 하나만 지정한다 (여러 개면 거부). **아무것도 안 주는 것이 기본 경로다**:
+# 그때는 스크립트 옆 ./daemond 를 먼저 보고, 없으면 공개 배포 채널(clickeye-dist)의 최신
+# 릴리스에서 이 호스트 아키텍처에 맞는 바이너리를 받아 SHA256SUMS 로 검증한 뒤 설치한다.
+#   --binary <경로>              로컬 바이너리 (지정하면 그 경로만 본다 — 없으면 폴백 없이 중단)
 #   --zip <경로|URL>             압축 안의 daemond 를 꺼내 설치. URL 이면 받아서.
 #                                --sha256 <값|파일> 이 함께 오면 검증 후에만 설치한다.
 #   --git <repo-url> [--git-ref <ref>]
@@ -70,7 +72,9 @@ usage() {
 
   --project <이름>   필수. 이 호스트에서 데몬을 구분하는 식별자이자 경로·유닛 이름.
                      허용 문자: A-Z a-z 0-9 . _ - (공백·슬래시·'..' 는 거부)
-  --binary <경로>    로컬 바이너리 (기본: 스크립트 옆 ./daemond)
+  --binary <경로>    로컬 바이너리. 지정하면 그 경로만 보고, 없으면 중단한다.
+                     (소스 옵션을 하나도 주지 않으면: 스크립트 옆 ./daemond → 없으면
+                      공개 배포 채널 최신 릴리스를 받아 SHA256SUMS 로 검증 후 설치)
   --zip <경로|URL>   압축 안의 daemond 를 꺼내 설치 (.zip / .tar.gz)
   --sha256 <값|파일> --zip 아카이브의 SHA-256. 없으면 검증을 건너뛴다(경고).
   --git <repo-url>   clone 후 go build (Go 툴체인 필요 / 비공개 리포는 자격증명 필요)
@@ -365,6 +369,57 @@ download_to() {
   info "다운로드 완료: $dt_url"
 }
 
+# ---------- 소스: 공개 배포 채널 (소스 옵션이 없을 때의 기본) ----------
+#
+# 소스 리포는 비공개이므로 배포 전용 공개 리포가 채널이다(ADR-0011). `latest` 를 쓰는 것은
+# 이 스크립트가 이미 멱등하게 "재실행 = 업그레이드"로 설계돼 있기 때문이다 — 특정 버전에
+# 고정해야 하는 납품은 그 태그의 자산 URL 을 `--zip` 으로 직접 주면 된다.
+DIST_RELEASE_BASE='https://github.com/yskim-tscorp/clickeye-dist/releases/latest/download'
+
+# resolve_release_asset — 이 호스트에 맞는 자산 이름을 RELEASE_ASSET 에 넣는다.
+#
+# 값을 출력하지 않고 전역에 넣는 이유는 die 다. `x=$(f)` 형태로 부르면 f 안의 die 는
+# **서브셸만** 죽이고, 그러면 지원하지 않는 아키텍처에서 빈 이름으로 계속 진행하게 된다.
+# set -e 가 결국 잡아 주긴 하지만, 그 사실에 기대는 것과 구조로 막는 것은 다르다.
+resolve_release_asset() {
+  rra_os=$(uname -s 2>/dev/null || echo unknown)
+  if [ "$rra_os" != Linux ]; then
+    die "이 스크립트의 자동 다운로드는 Linux 전용입니다 (감지: $rra_os)
+  Windows 는 install.ps1 을 쓰세요. 그 밖의 OS 는 바이너리를 반입한 뒤 --binary 로 지정하세요."
+  fi
+  rra_arch=$(uname -m 2>/dev/null || echo unknown)
+  case $rra_arch in
+    x86_64|amd64)   RELEASE_ASSET=daemond-linux-amd64 ;;
+    aarch64|arm64)  RELEASE_ASSET=daemond-linux-arm64 ;;
+    *) die "지원하지 않는 아키텍처입니다: $rra_arch
+  배포 채널이 내는 것은 linux amd64/arm64 뿐입니다 — 직접 빌드한 바이너리를 --binary 로 주세요." ;;
+  esac
+}
+
+# checksum_for — SHA256SUMS 에서 그 자산 한 줄의 해시를 꺼낸다.
+#
+# 첫 줄을 쓰지 않는 이유는 SHA256SUMS 가 자산 여섯 개를 담기 때문이다 — 첫 줄을 믿으면
+# 아키텍처가 다른 순간 "체크섬 불일치"가 뜨고, 그 메시지는 변조를 의심하게 만든다.
+# 이름 앞의 `*`(sha256sum 바이너리 모드 표기)는 떼고 비교한다.
+checksum_for() {
+  awk -v n="$2" '{ f = $2; sub(/^\*/, "", f); if (f == n) { print $1; exit } }' "$1"
+}
+
+download_release_binary() {
+  drb_out=$1
+  resolve_release_asset
+  info "설치 소스: 공개 배포 채널 최신 릴리스 ($RELEASE_ASSET)"
+  download_to "$DIST_RELEASE_BASE/$RELEASE_ASSET" "$drb_out"
+  download_to "$DIST_RELEASE_BASE/SHA256SUMS" "$TMP_DIR/SHA256SUMS"
+  drb_expect=$(checksum_for "$TMP_DIR/SHA256SUMS" "$RELEASE_ASSET")
+  # 검증을 건너뛰지 않는다. --zip 은 사람이 가져온 파일이라 경고 후 진행하지만, 이 경로는
+  # 스크립트가 스스로 고른 URL 이므로 대조할 것이 없으면 그것 자체가 이상이다.
+  [ -n "$drb_expect" ] || die "SHA256SUMS 에 $RELEASE_ASSET 항목이 없습니다 — 릴리스가 불완전합니다"
+  verify_checksum "$drb_out" "$drb_expect"
+  # 받은 파일에는 실행권한이 없다. 여기서 주지 않으면 아래 공통 검사가 매번 경고를 띄운다.
+  chmod +x "$drb_out" || die "다운로드한 바이너리에 실행권한을 줄 수 없습니다: $drb_out"
+}
+
 # ---------- 소스: zip/tar 에서 daemond 꺼내기 ----------
 extract_daemond() {
   ed_archive=$1
@@ -613,14 +668,27 @@ mkdir -p "$TMP_DIR/x"
 
 case $SRC_KIND in
   binary)
+    # 소스 옵션이 없을 때의 순서: 스크립트 옆 daemond → 공개 배포 채널.
+    #
+    # 옆에 있는 것을 먼저 보는 이유는 폐쇄망이다. 반입물을 스크립트 옆에 놔두고 소스 옵션
+    # 없이 돌리던 설치가 이 변경으로 갑자기 인터넷을 물면 그 설치는 실패하고, 실패 이유가
+    # 네트워크로 보여 원인이 이 변경이라는 것을 알아채기 어렵다.
+    #
+    # --binary 로 명시한 경로는 없으면 폴백하지 않고 그대로 죽는다: 사람이 지목한 파일이
+    # 없는 것은 폴백할 상황이 아니라 오타이며, 여기서 조용히 다운로드로 넘어가면 반입한
+    # 것과 다른 바이너리가 설치된다.
     if [ -n "$BINARY" ]; then
       BIN_SRC=$BINARY
-    else
+      [ -f "$BIN_SRC" ] || die "데몬 바이너리를 찾을 수 없습니다: $BIN_SRC — 경로를 확인하세요 (--binary 를 빼면 배포 채널에서 받습니다)"
+      info "설치 소스: 로컬 바이너리 $BIN_SRC"
+    elif [ -f "$SCRIPT_DIR/daemond" ]; then
       BIN_SRC=$SCRIPT_DIR/daemond
+      info "설치 소스: 로컬 바이너리 $BIN_SRC"
+    else
+      BIN_SRC=$TMP_DIR/daemond
+      download_release_binary "$BIN_SRC"
     fi
-    [ -f "$BIN_SRC" ] || die "데몬 바이너리를 찾을 수 없습니다: $BIN_SRC — 스크립트 옆에 daemond 를 두거나 --binary/--zip/--git 로 지정하세요"
     [ -x "$BIN_SRC" ] || warn "$BIN_SRC 에 실행권한이 없습니다 — 설치 시 0755 로 부여합니다"
-    info "설치 소스: 로컬 바이너리 $BIN_SRC"
     ;;
   zip)
     ARCHIVE=$TMP_DIR/pkg
