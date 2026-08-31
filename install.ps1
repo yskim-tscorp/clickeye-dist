@@ -25,7 +25,9 @@ Windows 의 수단(작업 스케줄러·ACL·ProgramData)으로 옮긴다. 규�
   파일 실행은 BOM 덕에 한국어가 살고, 파이프 실행은 TrimStart 덕에 파싱이 된다.
 
 설치 소스 3종 — 하나만 지정한다 (여러 개면 거부):
-  -Binary <경로>              로컬 바이너리 (기본: 스크립트 옆 .\daemond.exe)
+  -Binary <경로>              로컬 바이너리 (지정하면 그 경로만 본다 — 없으면 폴백 없이 중단)
+                              소스 옵션을 하나도 주지 않으면: 스크립트 옆 .\daemond.exe →
+                              없으면 공개 배포 채널 최신 릴리스를 받아 SHA256SUMS 로 검증 후 설치
   -Zip <경로|URL>             압축 안의 daemond.exe 를 꺼내 설치. URL 이면 받아서.
                               -Sha256 <값|파일> 이 함께 오면 검증 후에만 설치한다.
   -Git <repo-url> [-GitRef <ref>]
@@ -192,7 +194,9 @@ function Show-Usage {
                     허용 문자: A-Z a-z 0-9 . _ - (공백·슬래시·'..' 는 거부)
                     '-' 로 시작하는 값은 어차피 거부되지만, PowerShell 이 값을 플래그로
                     읽지 않게 하려면 -Project:"<값>" 형태로 준다.
-  -Binary <경로>    로컬 바이너리 (기본: 스크립트 옆 .\daemond.exe)
+  -Binary <경로>    로컬 바이너리. 지정하면 그 경로만 보고, 없으면 중단한다.
+                    (소스 옵션을 하나도 주지 않으면: 스크립트 옆 .\daemond.exe → 없으면
+                     공개 배포 채널 최신 릴리스를 받아 SHA256SUMS 로 검증 후 설치)
   -Zip <경로|URL>   압축 안의 daemond.exe 를 꺼내 설치 (.zip / .tar.gz)
   -Sha256 <값|파일> -Zip 아카이브의 SHA-256. 없으면 검증을 건너뛴다(경고).
   -Git <repo-url>   clone 후 go build (Go 툴체인 필요 / 비공개 리포는 자격증명 필요)
@@ -448,6 +452,55 @@ function Save-Download {
         Stop-Install ("다운로드 실패: {0}`n  {1}" -f $Url, $_.Exception.Message)
     }
     Write-Info ('다운로드 완료: {0}' -f $Url)
+}
+
+# ---------- 소스: 공개 배포 채널 (소스 옵션이 없을 때의 기본) ----------
+#
+# 소스 리포는 비공개이므로 배포 전용 공개 리포가 채널이다(ADR-0011). `latest` 를 쓰는 것은
+# 이 스크립트가 이미 멱등하게 "재실행 = 업그레이드"로 설계돼 있기 때문이다 — 특정 버전에
+# 고정해야 하는 납품은 그 태그의 자산 URL 을 -Zip 으로 직접 주면 된다.
+$script:DistReleaseBase = 'https://github.com/yskim-tscorp/clickeye-dist/releases/latest/download'
+
+function Get-ReleaseAssetName {
+    # 배포 채널이 내는 Windows 자산은 amd64 하나뿐이다. arm64 Windows 에서도 amd64 실행
+    # 파일은 에뮬레이션으로 돌기는 하지만, 그것을 조용히 설치하면 나중에 성능을 의심할 때
+    # 원인이 설치 시점의 선택이었다는 사실이 어디에도 남지 않는다 — 거절하고 이유를 말한다.
+    $arch = $env:PROCESSOR_ARCHITECTURE
+    if ($arch -ne 'AMD64') {
+        Stop-Install ("지원하지 않는 아키텍처입니다: {0}`n  배포 채널이 내는 Windows 자산은 amd64 뿐입니다 — 직접 빌드한 바이너리를 -Binary 로 주세요." -f $arch)
+    }
+    return 'daemond-windows-amd64.exe'
+}
+
+function Get-ChecksumFor {
+    param([string]$SumsFile, [string]$AssetName)
+    # 첫 줄을 쓰지 않는 이유는 SHA256SUMS 가 자산 여섯 개를 담기 때문이다 — 첫 줄을 믿으면
+    # 엉뚱한 자산의 해시와 대조하게 되고, 그때 뜨는 "체크섬 불일치"는 변조를 의심하게 만든다.
+    foreach ($line in Get-Content -LiteralPath $SumsFile) {
+        $parts = $line -split '\s+'
+        if ($parts.Count -lt 2) { continue }
+        $name = $parts[1] -replace '^\*', ''   # sha256sum 바이너리 모드의 `*` 표기
+        if ($name -eq $AssetName) { return $parts[0] }
+    }
+    return ''
+}
+
+function Get-ReleaseBinary {
+    param([string]$Destination, [string]$TempDir)
+
+    $asset = Get-ReleaseAssetName
+    Write-Info ('설치 소스: 공개 배포 채널 최신 릴리스 ({0})' -f $asset)
+    Save-Download -Url ('{0}/{1}' -f $script:DistReleaseBase, $asset) -OutFile $Destination
+
+    $sums = Join-Path $TempDir 'SHA256SUMS'
+    Save-Download -Url ('{0}/SHA256SUMS' -f $script:DistReleaseBase) -OutFile $sums
+    $expect = Get-ChecksumFor -SumsFile $sums -AssetName $asset
+    # 검증을 건너뛰지 않는다. -Zip 은 사람이 가져온 파일이라 경고 후 진행하지만, 이 경로는
+    # 스크립트가 스스로 고른 URL 이므로 대조할 것이 없으면 그것 자체가 이상이다.
+    if ([string]::IsNullOrEmpty($expect)) {
+        Stop-Install ('SHA256SUMS 에 {0} 항목이 없습니다 — 릴리스가 불완전합니다' -f $asset)
+    }
+    Assert-Checksum -File $Destination -Expected $expect
 }
 
 # ---------- 소스: 아카이브에서 daemond.exe 꺼내기 ----------
@@ -855,15 +908,31 @@ Agent CLI 가 없습니다 — claude 또는 codex 중 최소 하나가 PATH 에
     try {
         $binSrc = ''
         if ($Cfg.SrcKind -eq 'binary') {
+            # 소스 옵션이 없을 때의 순서: 스크립트 옆 daemond.exe → 공개 배포 채널.
+            #
+            # 옆에 있는 것을 먼저 보는 이유는 폐쇄망이다. 반입물을 스크립트 옆에 놔두고 소스
+            # 옵션 없이 돌리던 설치가 이 변경으로 갑자기 인터넷을 물면 그 설치는 실패하고,
+            # 실패 이유가 네트워크로 보여 원인이 이 변경이라는 것을 알아채기 어렵다.
+            #
+            # -Binary 로 명시한 경로는 없으면 폴백하지 않고 그대로 죽는다: 사람이 지목한
+            # 파일이 없는 것은 폴백할 상황이 아니라 오타이며, 여기서 조용히 다운로드로
+            # 넘어가면 반입한 것과 다른 바이너리가 설치된다.
             if (-not [string]::IsNullOrEmpty($Cfg.Binary)) {
                 $binSrc = $Cfg.Binary
+                if (-not (Test-Path -LiteralPath $binSrc -PathType Leaf)) {
+                    Stop-Install ('데몬 바이너리를 찾을 수 없습니다: {0} — 경로를 확인하세요 (-Binary 를 빼면 배포 채널에서 받습니다)' -f $binSrc)
+                }
+                Write-Info ('설치 소스: 로컬 바이너리 {0}' -f $binSrc)
             } else {
-                $binSrc = Join-Path $Cfg.ScriptDir 'daemond.exe'
+                $adjacent = Join-Path $Cfg.ScriptDir 'daemond.exe'
+                if (Test-Path -LiteralPath $adjacent -PathType Leaf) {
+                    $binSrc = $adjacent
+                    Write-Info ('설치 소스: 로컬 바이너리 {0}' -f $binSrc)
+                } else {
+                    $binSrc = Join-Path $tmp 'daemond.exe'
+                    Get-ReleaseBinary -Destination $binSrc -TempDir $tmp
+                }
             }
-            if (-not (Test-Path -LiteralPath $binSrc -PathType Leaf)) {
-                Stop-Install ('데몬 바이너리를 찾을 수 없습니다: {0} — 스크립트 옆에 daemond.exe 를 두거나 -Binary/-Zip/-Git 로 지정하세요' -f $binSrc)
-            }
-            Write-Info ('설치 소스: 로컬 바이너리 {0}' -f $binSrc)
         } elseif ($Cfg.SrcKind -eq 'zip') {
             $archive = ''
             if ($Cfg.Zip -match '^https?://') {
