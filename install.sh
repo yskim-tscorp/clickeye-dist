@@ -68,7 +68,7 @@ usage() {
   cat <<'USAGE'
 설치: sudo sh install.sh --project <이름> --cloud-url wss://<host>/ws/daemon --token <토큰> \
            [--binary <경로> | --zip <경로|URL> [--sha256 <값|파일>] | --git <repo-url> [--git-ref <ref>]] \
-           [--daemon-id <ID>] [--no-start]
+           [--channel <stable|edge>] [--daemon-id <ID>] [--no-start]
 
   --project <이름>   필수. 이 호스트에서 데몬을 구분하는 식별자이자 경로·유닛 이름.
                      허용 문자: A-Z a-z 0-9 . _ - (공백·슬래시·'..' 는 거부)
@@ -79,9 +79,15 @@ usage() {
   --sha256 <값|파일> --zip 아카이브의 SHA-256. 없으면 검증을 건너뛴다(경고).
   --git <repo-url>   clone 후 go build (Go 툴체인 필요 / 비공개 리포는 자격증명 필요)
   --git-ref <ref>    --git 과 함께 — 브랜치·태그·커밋
+  --channel <이름>   공개 배포 채널에서 받을 때의 채널 (기본: stable)
+                     stable — 릴리스된 최신 판.  edge — main 의 최신 빌드(검증 서버용 — 릴리스 전 판이다).
+                     소스 옵션(--binary/--zip/--git)과 함께 쓸 수 없다.
   --daemon-id <ID>   데몬 식별자 (기본: <hostname>-<project>)
   --anthropic-key <값>  AI CLI 자격 — env 에 ANTHROPIC_API_KEY 로 기록 (Console 조직 키)
   --oauth-token <값>    AI CLI 자격 — env 에 CLAUDE_CODE_OAUTH_TOKEN 로 기록
+  --gh-token <값>       저장소 토큰 — env 에 GH_TOKEN 로 기록 (clone·push·PR)
+                        없으면 데몬은 뜨지만 잡이 **마지막 단계(PR 생성)에서** 실패합니다.
+                        fine-grained PAT 권장: 대상 저장소 하나에 Contents RW + Pull requests RW.
                         (구독 토큰. 브라우저 있는 호스트에서 claude setup-token 으로 발급)
                         위 둘은 배타이며 **선택**이다 — 없어도 설치는 되고 AI 스텝만 실패한다.
   --no-start         파일 배치까지만 — systemd 없는 환경·CI 검증용
@@ -122,6 +128,17 @@ set_project_paths() {
   BIN_DST=$PROJ_DIR/daemond
   DATA_DIR=$PROJ_DIR/data
   WORK_DIR=$PROJ_DIR/workspaces
+  # HOME_DIR — 실행 사용자의 홈. AI CLI 가 자기 설정·상태를 쓸 자리다.
+  #
+  # 이것이 없으면 `claude -p` 는 **아무 출력도 내지 않고 멈춘다**(실측: exit 124, stdout·
+  # stderr 모두 빈 채). 실행 사용자의 홈이 $BASE_DIR(root 소유 0755)이라 쓸 수 없기 때문이다.
+  # 잡은 로그 한 줄 없이 타임아웃으로 실패하고, 그 화면에서는 원인을 짚을 방법이 없다.
+  # Docker 이미지는 `useradd -m` 이라 홈이 있어 이 경로를 밟지 않는다 — 그래서 두 배포
+  # 경로가 갈라져 있었다.
+  #
+  # 사용자 공용이 아니라 프로젝트별로 두는 이유는 격리다: 한 호스트의 데몬 여럿이 같은
+  # CLI 설정·세션 파일을 공유하면 한쪽의 상태가 다른 쪽 잡에 섞인다.
+  HOME_DIR=$PROJ_DIR/home
   ENV_FILE=$ENV_DIR/$PROJECT.env
   INSTANCE=$UNIT_NAME@$PROJECT
 }
@@ -375,6 +392,9 @@ download_to() {
 # 이 스크립트가 이미 멱등하게 "재실행 = 업그레이드"로 설계돼 있기 때문이다 — 특정 버전에
 # 고정해야 하는 납품은 그 태그의 자산 URL 을 `--zip` 으로 직접 주면 된다.
 DIST_RELEASE_BASE='https://github.com/yskim-tscorp/clickeye-dist/releases/latest/download'
+# edge 채널 — main 에 데몬 쪽 변경이 들어올 때마다 다시 만들어지는 사전 릴리스 하나(`edge`). 릴리스 전 판이라
+# 기본이 아니다: `--channel edge` 를 준 설치(우리 검증 서버)만 받는다. `latest` 는 사전 릴리스를 가리키지 않는다.
+DIST_EDGE_BASE='https://github.com/yskim-tscorp/clickeye-dist/releases/download/edge'
 
 # resolve_release_asset — 이 호스트에 맞는 자산 이름을 RELEASE_ASSET 에 넣는다.
 #
@@ -408,7 +428,11 @@ checksum_for() {
 download_release_binary() {
   drb_out=$1
   resolve_release_asset
-  info "설치 소스: 공개 배포 채널 최신 릴리스 ($RELEASE_ASSET)"
+  if [ "$CHANNEL" = edge ]; then
+    info "설치 소스: 공개 배포 채널 edge — main 의 최신 빌드, 릴리스 전 판입니다 ($RELEASE_ASSET)"
+  else
+    info "설치 소스: 공개 배포 채널 최신 릴리스 ($RELEASE_ASSET)"
+  fi
   download_to "$DIST_RELEASE_BASE/$RELEASE_ASSET" "$drb_out"
   download_to "$DIST_RELEASE_BASE/SHA256SUMS" "$TMP_DIR/SHA256SUMS"
   drb_expect=$(checksum_for "$TMP_DIR/SHA256SUMS" "$RELEASE_ASSET")
@@ -418,6 +442,100 @@ download_release_binary() {
   verify_checksum "$drb_out" "$drb_expect"
   # 받은 파일에는 실행권한이 없다. 여기서 주지 않으면 아래 공통 검사가 매번 경고를 띄운다.
   chmod +x "$drb_out" || die "다운로드한 바이너리에 실행권한을 줄 수 없습니다: $drb_out"
+}
+
+# ---------- 전제: Agent CLI 자동 설치 ----------
+#
+# 데몬은 AI 스텝을 CLI 서브프로세스로 실행하므로(steprunner) CLI 가 없으면 잡을 실행할
+# 수단이 없다. 예전에는 여기서 설치를 중단하고 `npm install -g` 를 안내했지만, 그러면
+# 콘솔 위저드의 원라이너가 "먼저 딴 걸 설치하고 오라"로 끝난다 — 설치 스크립트가 환경을
+# 세워 주는 물건인데 이 하나만 사람에게 미루고 있었다.
+#
+# 방법은 npm 이다. Docker 이미지가 쓰는 것과 같은 물건이어야 두 배포 경로가 어긋나지 않는다.
+AGENT_PKG='@anthropic-ai/claude-code'
+NODE_MIN=22
+NODE_ROOT=/usr/local/lib/nodejs
+NODE_DIST='https://nodejs.org/dist/latest-v22.x'
+
+# node_major — 설치된 node 의 메이저 버전. 없거나 해석 불가면 빈 문자열.
+node_major() {
+  command -v node >/dev/null 2>&1 || return 0
+  node -v 2>/dev/null | sed -n 's/^v\([0-9][0-9]*\)\..*/\1/p'
+}
+
+# install_node — Node 22 를 공식 배포 tarball 로 설치한다.
+#
+# 배포판 패키지를 쓰지 않는 이유는 버전이다 — Debian 12·Ubuntu 24.04 모두 Node 18 이라
+# CLI 의 engines(>=22)를 못 넘는다. NodeSource 저장소를 붙이는 방법도 있으나 그것은 고객
+# 서버의 apt 소스를 우리가 영구히 바꾸는 일이라, 우리 트리 안에 풀고 링크만 거는 쪽을 골랐다.
+# 되돌리려면 그 디렉터리와 링크만 지우면 된다.
+install_node() {
+  case $(uname -m) in
+    x86_64|amd64)  in_arch=x64 ;;
+    aarch64|arm64) in_arch=arm64 ;;
+    *) die "지원하지 않는 아키텍처라 Node 를 자동 설치할 수 없습니다: $(uname -m) — Node $NODE_MIN+ 를 직접 설치한 뒤 다시 실행하세요" ;;
+  esac
+  command -v tar >/dev/null 2>&1 || die "tar 가 없어 Node 를 설치할 수 없습니다 — tar 를 설치하거나 Node $NODE_MIN+ 를 직접 설치하세요"
+
+  in_tmp=$(mktemp -d 2>/dev/null || mktemp -d -t clickeye-node)
+  # 버전을 스크립트에 박지 않는다. SHASUMS256.txt 한 장에서 파일 이름과 체크섬을 함께
+  # 얻으므로, 최신 22.x 가 올라가도 이 스크립트는 고칠 것이 없고 검증도 공짜로 따라온다.
+  download_to "$NODE_DIST/SHASUMS256.txt" "$in_tmp/SHASUMS256.txt"
+  in_file=$(awk -v s="linux-$in_arch.tar.gz" '$2 ~ ("^node-v22\\..*-" s "$") { print $2; exit }' "$in_tmp/SHASUMS256.txt")
+  if [ -z "$in_file" ]; then
+    rm -rf "$in_tmp"
+    die "Node 배포 목록에서 linux-$in_arch 자산을 찾지 못했습니다 — $NODE_DIST/SHASUMS256.txt 를 확인하세요"
+  fi
+  in_hash=$(awk -v f="$in_file" '$2 == f { print $1; exit }' "$in_tmp/SHASUMS256.txt")
+
+  info "Node.js 설치: $in_file"
+  download_to "$NODE_DIST/$in_file" "$in_tmp/$in_file"
+  verify_checksum "$in_tmp/$in_file" "$in_hash"
+
+  mkdir -p "$NODE_ROOT"
+  tar -xzf "$in_tmp/$in_file" -C "$NODE_ROOT" || { rm -rf "$in_tmp"; die "Node 아카이브 해제 실패"; }
+  in_dir=$NODE_ROOT/$(printf '%s' "$in_file" | sed 's/\.tar\.gz$//')
+  rm -rf "$in_tmp"
+  [ -x "$in_dir/bin/node" ] || die "Node 아카이브 구조가 예상과 다릅니다: $in_dir/bin/node 가 없습니다"
+  # /usr/local/bin 에 링크한다 — 데몬은 clickeye 사용자로 돌고 그 PATH 에 있어야 한다.
+  for in_b in node npm npx; do
+    ln -sf "$in_dir/bin/$in_b" "/usr/local/bin/$in_b"
+  done
+  info "Node.js 설치 완료: $(node -v 2>/dev/null || echo unknown) ($in_dir)"
+}
+
+install_agent_cli() {
+  ia_major=$(node_major)
+  if [ -z "$ia_major" ]; then
+    install_node
+  else
+    case $ia_major in
+      ''|*[!0-9]*) die "node -v 출력을 해석할 수 없습니다 — Node $NODE_MIN+ 를 직접 확인하세요" ;;
+    esac
+    if [ "$ia_major" -lt "$NODE_MIN" ]; then
+      # 이미 있는 Node 를 갈아치우지 않는다. 이 호스트의 다른 프로그램이 그 버전에 매여
+      # 있을 수 있고, 설치 스크립트가 조용히 바꿔 놓으면 그쪽이 깨진 이유를 여기서 찾을 수 없다.
+      die "Node.js $ia_major 가 설치돼 있지만 Agent CLI 는 $NODE_MIN 이상이 필요합니다.
+  이 스크립트는 이미 있는 Node 를 교체하지 않습니다 — 이 호스트의 다른 프로그램이 그 버전에
+  매여 있을 수 있습니다. Node 를 올린 뒤 다시 실행하거나, CLI 를 먼저 설치하세요:
+    npm install -g $AGENT_PKG"
+    fi
+  fi
+  command -v npm >/dev/null 2>&1 || die "npm 이 없습니다 — Node 설치가 온전하지 않습니다"
+
+  ia_log=$(mktemp 2>/dev/null || mktemp -t clickeye-npm)
+  info "Agent CLI 설치: npm install -g $AGENT_PKG"
+  # --prefix /usr/local — 전역 설치 자리를 명시한다. node 를 우리 트리에 풀었을 때 npm 의
+  # 기본 prefix 는 그 트리 안이 되고, 그러면 claude 가 /usr/local/bin 에 안 놓여
+  # 데몬 사용자의 PATH 에서 사라진다.
+  if ! npm install -g --prefix /usr/local "$AGENT_PKG" >"$ia_log" 2>&1; then
+    tail -20 "$ia_log" >&2
+    rm -f "$ia_log"
+    die "Agent CLI 설치 실패 — 위 npm 출력을 확인하세요"
+  fi
+  rm -f "$ia_log"
+  command -v claude >/dev/null 2>&1 || die "설치는 끝났는데 claude 가 PATH 에 없습니다 — /usr/local/bin 이 PATH 에 있는지 확인하세요"
+  info "Agent CLI 설치 완료: $(claude --version 2>/dev/null || echo unknown)"
 }
 
 # ---------- 소스: zip/tar 에서 daemond 꺼내기 ----------
@@ -518,6 +636,7 @@ DAEMON_ID=${CLICKEYE_DAEMON_ID:-}
 # 자격은 명시적으로 건네는 값이어야 한다.
 ANTHROPIC_KEY=''
 OAUTH_TOKEN=''
+GH_TOKEN_VALUE=''
 CRED_COUNT=0    # 자격 플래그 개수 — 2 면 거부
 
 BINARY=''
@@ -531,6 +650,8 @@ PURGE_DATA=0
 INSTALL_ARGS=0  # 설치 전용 플래그가 하나라도 오면 1 — --uninstall 과의 혼용 거부용
 SRC_COUNT=0     # 소스 옵션 개수 — 2 이상이면 거부
 SRC_KIND=binary
+CHANNEL=stable
+CHANNEL_SET=0
 
 while [ $# -gt 0 ]; do
   case $1 in
@@ -550,12 +671,17 @@ while [ $# -gt 0 ]; do
     --git=*)       GIT_URL=${1#--git=}; SRC_KIND=git; SRC_COUNT=$((SRC_COUNT + 1)); INSTALL_ARGS=1; shift ;;
     --git-ref)     [ $# -ge 2 ] || die "--git-ref 뒤에 값이 없습니다"; GIT_REF=$2; INSTALL_ARGS=1; shift 2 ;;
     --git-ref=*)   GIT_REF=${1#--git-ref=}; INSTALL_ARGS=1; shift ;;
+    --channel)     [ $# -ge 2 ] || die "--channel 뒤에 값이 없습니다"; CHANNEL=$2; CHANNEL_SET=1; INSTALL_ARGS=1; shift 2 ;;
+    --channel=*)   CHANNEL=${1#--channel=}; CHANNEL_SET=1; INSTALL_ARGS=1; shift ;;
     --daemon-id)   [ $# -ge 2 ] || die "--daemon-id 뒤에 값이 없습니다"; DAEMON_ID=$2; INSTALL_ARGS=1; shift 2 ;;
     --daemon-id=*) DAEMON_ID=${1#--daemon-id=}; INSTALL_ARGS=1; shift ;;
     --anthropic-key)   [ $# -ge 2 ] || die "--anthropic-key 뒤에 값이 없습니다"; ANTHROPIC_KEY=$2; CRED_COUNT=$((CRED_COUNT + 1)); INSTALL_ARGS=1; shift 2 ;;
     --anthropic-key=*) ANTHROPIC_KEY=${1#--anthropic-key=}; CRED_COUNT=$((CRED_COUNT + 1)); INSTALL_ARGS=1; shift ;;
     --oauth-token)     [ $# -ge 2 ] || die "--oauth-token 뒤에 값이 없습니다"; OAUTH_TOKEN=$2; CRED_COUNT=$((CRED_COUNT + 1)); INSTALL_ARGS=1; shift 2 ;;
     --oauth-token=*)   OAUTH_TOKEN=${1#--oauth-token=}; CRED_COUNT=$((CRED_COUNT + 1)); INSTALL_ARGS=1; shift ;;
+    # 저장소 토큰은 CRED_COUNT 에 넣지 않는다 — AI 자격과 배타적이지 않고, 둘 다 필요하다.
+    --gh-token)        [ $# -ge 2 ] || die "--gh-token 뒤에 값이 없습니다"; GH_TOKEN_VALUE=$2; INSTALL_ARGS=1; shift 2 ;;
+    --gh-token=*)      GH_TOKEN_VALUE=${1#--gh-token=}; INSTALL_ARGS=1; shift ;;
     --no-start)    NO_START=1; INSTALL_ARGS=1; shift ;;
     --uninstall)   UNINSTALL=1; shift ;;
     --purge-data)  PURGE_DATA=1; shift ;;
@@ -586,6 +712,15 @@ if [ "$SRC_COUNT" -gt 1 ]; then
   usage >&2
   die "설치 소스는 하나만 지정하세요 — --binary / --zip / --git 중 택 1 (지정된 개수: $SRC_COUNT)"
 fi
+# 채널은 「공개 배포 채널에서 받을 때」만 뜻이 있다 — 소스를 직접 준 설치에 붙이면 어느 쪽이 설치됐는지 흐려진다.
+case $CHANNEL in
+  stable) ;;
+  edge)   DIST_RELEASE_BASE=$DIST_EDGE_BASE ;;
+  *)      usage >&2; die "--channel 은 stable 또는 edge 입니다 (받은 값: $CHANNEL)" ;;
+esac
+if [ "$CHANNEL_SET" -eq 1 ] && [ "$SRC_COUNT" -gt 0 ]; then
+  die "--channel 은 소스 옵션(--binary/--zip/--git)과 함께 쓸 수 없습니다 — 채널은 공개 배포 채널에서 받을 때만 고릅니다"
+fi
 if [ -n "$SHA256" ] && [ "$SRC_KIND" != zip ]; then
   die "--sha256 은 --zip 과 함께만 쓸 수 있습니다"
 fi
@@ -596,6 +731,51 @@ fi
 if [ -n "$GIT_REF" ] && [ "$SRC_KIND" != git ]; then
   die "--git-ref 는 --git 과 함께만 쓸 수 있습니다"
 fi
+
+# ---------- 필수 인자·접속 주소 ----------
+# 도구 설치(Node·Agent CLI)보다 **먼저** 본다 — 주소가 틀렸다는 것을 몇 분 걸리는 설치가 끝난 뒤에 알게 하지 않는다.
+[ -n "$CLOUD_URL" ] || { usage >&2; die "--cloud-url (또는 CLICKEYE_CLOUD_URL) 이 필요합니다 — Cloud WS 주소 (wss://<host>/ws/daemon)"; }
+[ -n "$TOKEN" ]     || { usage >&2; die "--token (또는 CLICKEYE_CLOUD_TOKEN) 이 필요합니다 — 관제 콘솔의 데몬 토큰 화면에서 발급"; }
+
+# 접속 주소 점검 — 「설치는 됐는데 붙지 않는다」의 대부분이 주소다(2026-11-11 실측). 막지 않고 **설치할 때 말한다**:
+# 주소가 맞는지는 이 호스트의 사정이라 스크립트가 단정할 수 없다. 인터페이스는 그대로다(새 플래그 없음).
+#
+#   - 자리표시자(<...>)가 남았으면 중단 — 그대로는 절대 붙지 않는다.
+#   - 스킴이 ws/wss 가 아니면 중단.
+#   - localhost·127.x·host.docker.internal — 이 호스트 자신을 가리킨다. 관제 서버가 다른 PC 에 있으면 붙지 않는다.
+#   - 평문 ws:// 로 다른 호스트 — 데몬은 기본으로 거부한다(토큰과 자격이 평문으로 지나간다). 여기서 허용 스위치를
+#     env 에 적어 주고 경고한다. 원하지 않으면 wss:// 주소로 다시 설치한다.
+INSECURE_WS=0
+case $CLOUD_URL in
+  *'<'*|*'>'*) die "--cloud-url 에 자리표시자가 남아 있습니다: $CLOUD_URL — <backend-host> 를 관제 서버의 실제 주소로 바꾸세요" ;;
+esac
+case $CLOUD_URL in
+  ws://*|wss://*|WS://*|WSS://*) ;;
+  *) die "--cloud-url 은 ws:// 또는 wss:// 로 시작해야 합니다: $CLOUD_URL (예: wss://<host>/ws/daemon)" ;;
+esac
+WS_HOST=${CLOUD_URL#*://}
+WS_HOST=${WS_HOST%%/*}
+case $WS_HOST in
+  \[*) WS_HOST=${WS_HOST#\[}; WS_HOST=${WS_HOST%%\]*} ;;
+  *)   WS_HOST=${WS_HOST%%:*} ;;
+esac
+case $WS_HOST in
+  localhost|127.*|::1)
+    warn "접속 주소가 이 호스트 자신($WS_HOST)을 가리킵니다 — 관제 서버가 이 호스트에 떠 있을 때만 붙습니다. 다른 PC 에 있으면 그 PC 의 주소로 다시 설치하세요" ;;
+  host.docker.internal)
+    warn "host.docker.internal 은 Docker 컨테이너 안에서만 풀리는 이름입니다 — 이 설치(systemd)에서는 이름 풀이에 실패할 수 있습니다. 관제 서버의 실제 주소(이름이나 IP)를 쓰세요" ;;
+  *)
+    case $CLOUD_URL in
+      ws://*|WS://*)
+        INSECURE_WS=1
+        warn "평문 ws:// 로 다른 호스트($WS_HOST)에 붙습니다 — 데몬 토큰과 내려오는 자격·명령이 암호화 없이 지나갑니다"
+        warn "신뢰하는 내부망으로 보고 허용 스위치(CLICKEYE_ALLOW_INSECURE_WS=1)를 env 에 적습니다. 원하지 않으면 wss:// 주소로 다시 설치하세요" ;;
+    esac ;;
+esac
+case $CLOUD_URL in
+  */ws/daemon|*/ws/daemon/) ;;
+  *) warn "접속 주소가 /ws/daemon 으로 끝나지 않습니다: $CLOUD_URL — 리버스 프록시가 다른 경로에 걸어 둔 것이 아니면 404 로 붙지 않습니다" ;;
+esac
 
 # ---------- 1. 전제 검사 ----------
 [ "$(uname -s)" = "Linux" ] || die "이 스크립트는 Linux 전용입니다 (현재: $(uname -s)). Windows/macOS 는 Docker 설치(가이드 §2)를 쓰세요"
@@ -618,9 +798,11 @@ fi
 if command -v codex >/dev/null 2>&1; then
   if [ -n "$AGENT_CLIS" ]; then AGENT_CLIS="$AGENT_CLIS, codex"; else AGENT_CLIS=codex; fi
 fi
-[ -n "$AGENT_CLIS" ] || die "Agent CLI 가 없습니다 — claude 또는 codex 중 최소 하나가 PATH 에 있어야 합니다
-  데몬이 잡을 실행할 수단이 없으므로 설치를 중단합니다.
-  설치: npm install -g @anthropic-ai/claude-code  (또는 codex CLI)"
+if [ -z "$AGENT_CLIS" ]; then
+  info "Agent CLI 가 없습니다 — 설치합니다 (claude)"
+  install_agent_cli
+  AGENT_CLIS=claude
+fi
 
 # git·Node 는 **기동 차단 사유가 아니다**(경고로 낮춘다).
 # 근거: 무엇이 빠졌는지는 데몬이 접속 시 관제로 올려(daemon.hello.env) 콘솔이 한자리에서
@@ -629,6 +811,12 @@ fi
 if ! command -v git >/dev/null 2>&1; then
   warn "git 이 없습니다 — 잡 작업공간 provisioning 이 실패합니다. 설치를 계속하되 보강하세요 (apt-get install -y git)"
   warn "  (부재 사실은 데몬이 접속 시 관제 콘솔에 환경 리포트로 올립니다)"
+fi
+# gh — 작업의 결과(PR)를 만들고 콘솔 머지를 집행하는 도구다. clone·push 는 gh 없이도 저장소 토큰으로 되지만(데몬이 git 에
+# 직접 잇는다), PR 생성은 gh 뿐이다 — 없으면 작업이 AI 단계를 다 돌린 뒤 맨 끝에서 실패한다. 로컬 저장소 모드만 쓰면 필요 없다.
+if ! command -v gh >/dev/null 2>&1; then
+  warn "gh(GitHub CLI)가 없습니다 — 작업이 맨 끝(PR 생성)에서 실패하고 콘솔 머지도 되지 않습니다. 설치를 계속하되 보강하세요"
+  warn "  (https://github.com/cli/cli#installation — 부재 사실은 콘솔 데몬 카드의 「저장소 쓰기」에도 보입니다)"
 fi
 if ! command -v node >/dev/null 2>&1; then
   warn "Node.js 가 없습니다 — Node 기반 AI CLI 실행에 필요합니다(권장 22+). 설치를 계속하되 보강하세요"
@@ -645,8 +833,6 @@ else
   esac
 fi
 
-[ -n "$CLOUD_URL" ] || { usage >&2; die "--cloud-url (또는 CLICKEYE_CLOUD_URL) 이 필요합니다 — Cloud WS 주소 (wss://<host>/ws/daemon)"; }
-[ -n "$TOKEN" ]     || { usage >&2; die "--token (또는 CLICKEYE_CLOUD_TOKEN) 이 필요합니다 — 관제 콘솔의 데몬 토큰 화면에서 발급"; }
 
 # 구 단일 인스턴스 설치가 남아 있으면 알린다 (자동 이관은 하지 않는다).
 if [ -f "$LEGACY_UNIT" ] || [ -f "$LEGACY_BIN" ]; then
@@ -681,7 +867,8 @@ case $SRC_KIND in
       BIN_SRC=$BINARY
       [ -f "$BIN_SRC" ] || die "데몬 바이너리를 찾을 수 없습니다: $BIN_SRC — 경로를 확인하세요 (--binary 를 빼면 배포 채널에서 받습니다)"
       info "설치 소스: 로컬 바이너리 $BIN_SRC"
-    elif [ -f "$SCRIPT_DIR/daemond" ]; then
+    elif [ "$CHANNEL_SET" -eq 0 ] && [ -f "$SCRIPT_DIR/daemond" ]; then
+      # --channel 을 명시했으면 옆의 파일을 보지 않는다 — 채널을 고른 사람은 그 채널의 판을 원한다.
       BIN_SRC=$SCRIPT_DIR/daemond
       info "설치 소스: 로컬 바이너리 $BIN_SRC"
     else
@@ -745,12 +932,12 @@ fi
 #      프로젝트 디렉터리 자체는 root 소유(0755)로 둔다 — 그 안의 바이너리를
 #      데몬 실행 사용자가 바꿔치기하지 못하게 한다. 쓰기가 필요한 데이터·작업공간만
 #      $RUN_USER 소유로 내린다.
-mkdir -p "$DATA_DIR" "$WORK_DIR"
+mkdir -p "$DATA_DIR" "$WORK_DIR" "$HOME_DIR"
 chown root:root "$PROJ_DIR"
 chmod 0755 "$PROJ_DIR"
-chown "$RUN_USER:$RUN_USER" "$DATA_DIR" "$WORK_DIR"
-chmod 0750 "$DATA_DIR" "$WORK_DIR"
-info "프로젝트 디렉터리: $PROJ_DIR (data, workspaces)"
+chown "$RUN_USER:$RUN_USER" "$DATA_DIR" "$WORK_DIR" "$HOME_DIR"
+chmod 0750 "$DATA_DIR" "$WORK_DIR" "$HOME_DIR"
+info "프로젝트 디렉터리: $PROJ_DIR (data, workspaces, home)"
 
 # 3-3) 바이너리 — 이 인스턴스가 실행 중이면 정지 후 교체 (업그레이드 경로).
 #      다른 프로젝트의 인스턴스는 건드리지 않는다.
@@ -776,22 +963,69 @@ umask 077
   printf 'CLICKEYE_CLOUD_URL=%s\n' "$CLOUD_URL"
   printf 'CLICKEYE_CLOUD_TOKEN=%s\n' "$TOKEN"
   printf 'CLICKEYE_REQUIRE_CLOUD=true\n'
+  # 평문 ws:// 원격 접속 허용 — 위 「접속 주소 점검」이 경고하고 켠 경우에만.
+  if [ "$INSECURE_WS" -eq 1 ]; then printf 'CLICKEYE_ALLOW_INSECURE_WS=1\n'; fi
   printf 'CLICKEYE_DATA_DIR=%s\n' "$DATA_DIR"
   printf 'CLICKEYE_WORKSPACE_DIR=%s\n' "$WORK_DIR"
   printf 'CLICKEYE_LOCAL_API=127.0.0.1:%s\n' "$LOCAL_API_PORT"
   printf 'CLICKEYE_DAEMON_ID=%s\n' "$DAEMON_ID"
+  # HOME — 우리 변수가 아니지만 여기서 정한다. systemd 는 passwd 의 홈($BASE_DIR, 쓰기
+  # 불가)을 넣으므로, 덮지 않으면 AI CLI 가 설정을 쓰지 못해 출력 없이 멈춘다(set_project_paths 주석).
+  printf 'HOME=%s\n' "$HOME_DIR"
   # AI CLI 자격 — **지정된 쪽만** 쓴다. 빈 값으로 써 두면 CLI 는 "설정됐지만 비어 있다"로
   # 읽어 인증 실패 메시지가 달라지고, 무엇이 빠졌는지 찾기 어려워진다.
   # `[ -n x ] && printf` 로 쓰지 않는다: set -e 아래에서 그 AND-OR 리스트는 조건이 거짓일 때
   # 통째로 실패로 평가되어 **자격을 안 넣은 설치가 여기서 죽는다** — 그게 기본 경로다.
   if [ -n "$ANTHROPIC_KEY" ]; then printf 'ANTHROPIC_API_KEY=%s\n' "$ANTHROPIC_KEY"; fi
   if [ -n "$OAUTH_TOKEN" ];   then printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$OAUTH_TOKEN"; fi
+  # 저장소 토큰 — 데몬이 기동 때 읽어 **자기 환경에서는 지우고** 메모리에 든다. 그래야 잡
+  # 스텝이 물려받지 못하고(권한 우회로 도는 AI 가 자기 PR 을 머지하지 못한다), 관제가 나중에
+  # 중앙에서 내려보내는 값과 경로가 하나로 합쳐진다.
+  if [ -n "$GH_TOKEN_VALUE" ]; then printf 'GH_TOKEN=%s\n' "$GH_TOKEN_VALUE"; fi
 } > "$ENV_FILE.tmp"
 umask "$OLD_UMASK"
 chown "$RUN_USER:$RUN_USER" "$ENV_FILE.tmp"
 chmod 0600 "$ENV_FILE.tmp"
 mv -f "$ENV_FILE.tmp" "$ENV_FILE"
 info "env 작성: $ENV_FILE (0600, $RUN_USER 소유, localapi=127.0.0.1:$LOCAL_API_PORT)"
+
+# 3-4b) 연결 확인 — CLI 가 **데몬이 실제로 쓸 환경 그대로** 인증되는지 한 번 호출해 본다.
+#
+# 설치가 끝났다는 말과 잡이 돌 것이라는 말은 다르다. 자격이 틀렸거나 실행 사용자가 CLI 를
+# 못 돌리는 상태는 지금까지 첫 잡이 실패한 뒤에야 드러났고, 그 화면(로그 없는 타임아웃)
+# 에서는 원인을 짚을 수 없었다. 그래서 여기서 미리 한 번 부딪혀 본다.
+#
+# 실패해도 설치를 되돌리지 않는다(warn). 데몬 자체는 정상 접속하고, 자격은 env 를 고쳐
+# 재기동하면 되며, 부재 사실은 콘솔이 환경 리포트로 이미 보여 준다 — git·Node 를 경고로
+# 낮춘 것과 같은 판단이다.
+#
+# 자격을 **인자로 넘기지 않는다.** `su -c` 의 명령 문자열은 ps 에 그대로 보이므로, 경로만
+# 넘기고 값은 그 안에서 0600 env 파일을 읽어 채운다.
+if [ -n "$ANTHROPIC_KEY" ] || [ -n "$OAUTH_TOKEN" ]; then
+  if command -v claude >/dev/null 2>&1; then
+    info "연결 확인: $RUN_USER 로 claude 를 한 번 호출합니다 (최대 90초)"
+    VA_CMD="set -a; . '$ENV_FILE'; set +a; exec claude -p 'Reply with exactly: OK'"
+    if command -v timeout >/dev/null 2>&1; then
+      VA_OUT=$(timeout 90 su -s /bin/sh "$RUN_USER" -c "$VA_CMD" 2>&1) || true
+    else
+      VA_OUT=$(su -s /bin/sh "$RUN_USER" -c "$VA_CMD" 2>&1) || true
+    fi
+    case $VA_OUT in
+      *OK*)
+        info "연결 확인 통과 — AI 스텝이 실행 가능합니다" ;;
+      '')
+        # 실측된 모습이다: 실행 사용자가 홈에 쓰지 못하면 출력이 통째로 비고 타임아웃난다.
+        warn "연결 확인 실패 — CLI 가 아무 출력도 내지 않았습니다(타임아웃)."
+        warn "  실행 사용자가 홈($HOME_DIR)에 쓸 수 있는지 확인하세요. 잡은 로그 없이 실패합니다." ;;
+      *)
+        warn "연결 확인 실패 — CLI 가 인증되지 않았습니다:"
+        printf '%s\n' "$VA_OUT" | head -5 | sed 's/^/[install]   /' >&2
+        warn "  자격을 고치려면 $ENV_FILE 을 수정하고 서비스를 재기동하세요." ;;
+    esac
+  fi
+else
+  info "AI CLI 자격이 지정되지 않았습니다 — 데몬은 접속하지만 AI 스텝은 실패합니다(가이드 §1.3)"
+fi
 
 # 3-5) systemd 템플릿 유닛 (공용 — %i 가 프로젝트 이름으로 치환된다)
 cat > "$TEMPLATE_UNIT" <<'UNIT'
@@ -813,6 +1047,17 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 UNIT
 info "systemd 템플릿 유닛 배치: $TEMPLATE_UNIT (인스턴스: $INSTANCE)"
+
+# ---------- 3.9 관제 접속 점검 ----------
+# 띄우기 전에 「이 호스트에서 이 주소·토큰으로 관제에 닿는가」를 순서대로 본다(daemond check). 막혀도 설치는 계속한다 —
+# 데몬은 떠서 다시 붙기를 반복하므로, 주소·방화벽을 고친 뒤 재설치 없이 붙을 수 있다. 어디에서 막혔는지는 여기서 보인다.
+# check 를 모르는 옛 바이너리는 인자를 무시하고 데몬으로 떠 버리므로, 그 문구가 든 바이너리에서만 돌린다.
+if grep -q 'daemond check' "$BIN_DST" 2>/dev/null || grep -aq '관제 접속 점검' "$BIN_DST" 2>/dev/null; then
+  info "관제 접속 점검 — 어디에서 막히는지 순서대로 봅니다:"
+  if ( set -a; . "$ENV_FILE"; set +a; "$BIN_DST" check ) 2>&1 | sed 's/^/[install]   /'; then :; fi
+else
+  info "관제 접속 점검을 건너뜁니다 — 이 바이너리에는 check 명령이 없습니다(옛 판)"
+fi
 
 # ---------- 4. 기동 + 검증 ----------
 if [ "$NO_START" -eq 1 ]; then
